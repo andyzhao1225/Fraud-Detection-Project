@@ -1,0 +1,779 @@
+---
+title: "Fraud Detection Project"
+author: "Andy Zhao"
+date: "2023-04-04"
+output:
+  html_document:
+    toc: yes
+    toc_depth: '3'
+    df_print: paged
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center')
+```
+
+## Overview
+
+The objective of this project is to build some models to assess their qualities in detecting credit card transaction fraud. The dataset is downloaded from this website<https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud>.
+
+The Time, Amount,and V1-28 columns are predictors. The Class is the response variable, 1 represents fraud, 0 represents legal, and there are 492 frauds out of 284,807 transactions. The frauds account for 0.172% of all transactions. The dataset's extremely unbalanced. Thus AUC score would be unreliable. So AUPRC would be measured and compared between those values.
+
+A good Area Under Precision Recall Curve should be higher than 0.8. After the training and evaluating of 9 popular models, **lightGBM** model wins with the highest AUPRC value at **0.8245189**.
+
+
+```{r, include=FALSE}
+#install the required libraries
+if(!require(tidyverse)) install.packages("tidyverse") 
+if(!require(reshape2)) install.packages("reshape2") 
+if(!require(corrplot)) install.packages("corrplot") 
+if(!require(kableExtra)) install.packages("kableExtra") 
+if(!require(ROCR)) install.packages("ROCR") 
+if(!require(PRROC)) install.packages("PRROC") 
+if(!require(caret)) install.packages("caret") 
+if(!require(rpart)) install.packages("rpart") 
+if(!require(rpart.plot)) install.packages("rpart.plot") 
+if(!require(randomForest)) install.packages("randomForest") 
+if(!require(class)) install.packages("class") 
+if(!require(caTools)) install.packages("caTools") 
+if(!require(e1071)) install.packages("e1071") 
+if(!require(gbm)) install.packages("gbm") 
+if(!require(lightgbm)) install.packages("lightgbm") 
+if(!require(xgboost)) install.packages("xgboost") 
+if(!require(keras)) install.packages("keras") 
+if(!require(tensorflow)) install.packages("tensorflow") 
+```
+
+
+```{r, include=FALSE}
+#load the libraries
+library(tidyverse)
+library(reshape2) #to use melt()
+library(corrplot)
+library(kableExtra)
+library(ROCR) #to use prediction() and performance
+library(PRROC) #to use pr.curve()
+library(caret)
+library(rpart)
+library(rpart.plot) #to use prp()
+library(randomForest)
+library(class) #to use knn()
+library(caTools) #to use sample.split()
+library(e1071) #to use svm()
+library(gbm)
+library(lightgbm)
+library(xgboost)
+library(keras)
+library(tensorflow)
+```
+
+## Exploratory Data Analysis
+First, read the dataset, check its dimensions, structures, and confirm that features V1, V2, … V28 are the principal components obtained with PCA. Time isn't
+as relevant, so will be removed. Amount should be scaled. Correlation matrix plot and heatmap show that V17, V14 and V12 might be the most significant variables.
+
+
+### Data Exploration
+```{r}
+#clear environment
+rm(list=ls())
+
+#make reproducible
+set.seed(1)
+
+#set working directories
+setwd("/users/zhaolong/downloads")
+
+#read the dataset
+cc<- read.csv("creditcard.csv")
+```
+
+
+```{r}
+#data exploratory
+dim(cc)
+str(cc)
+#summary(cc)
+head(cc,3)
+table(cc$Class)
+```
+
+
+```{r}
+#find missing values
+sapply(cc, function(x) sum(is.na(x)))
+```
+
+### Data Visualization
+```{r}
+#Proportions between Legal and Frauds Transactions
+cc %>%
+  ggplot(aes(Class)) +
+  geom_bar() +  
+  scale_x_discrete() +
+  labs(title = "Proportions between Legal and Frauds Transactions")
+```
+
+
+```{r}
+#Frequency of Transaction Time
+cc %>%
+  ggplot(aes(Time)) + 
+  theme_minimal()  +
+  geom_histogram(binwidth = 10)  +
+  labs(title = "Frequency of Transaction Time")
+
+#Fraud Frequency by Time
+cc[cc$Class==1,] %>% group_by(Time) %>%
+  summarize(count=n()) %>%
+  ggplot(aes(Time, count)) +
+  geom_point() +
+  geom_smooth() +
+  ggtitle("Fraud Frequency by Time")
+
+#Legal Frequency by Time
+cc[cc$Class==0,] %>% group_by(Time) %>%
+  summarize(count=n()) %>%
+  ggplot(aes(Time, count)) +
+  geom_point() +
+  geom_smooth() +
+  ggtitle("Legal Frequency by Time")
+```
+
+
+```{r}
+#Frauds Amounts Distributions
+cc%>%
+  ggplot(aes(Amount)) + 
+  geom_histogram(binwidth = 100) +
+  labs(title = "Transaction Amounts Distributions")
+```
+
+
+```{r}
+#Top 10 Transaction Amounts
+cc%>%
+  group_by(Amount) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  head(n=10) %>% kable() %>% kable_styling(latex_options = "HOLD_position",bootstrap_options = c("responsive"),
+                                           position = "center",
+                                           full_width = FALSE) %>% column_spec(2,color = "white" , background ="green")
+```
+
+
+```{r}
+#Bottom 10 Transaction Amounts
+cc%>%
+  group_by(Amount) %>%
+  summarise(count = n()) %>%
+  arrange(count) %>%
+  head(n=10) %>% kable() %>% kable_styling(latex_options = "HOLD_position",bootstrap_options = c("responsive"),
+                                       position = "center",
+                                       full_width = FALSE) %>% column_spec(2,color = "white" , background ="red")
+```
+
+Correlation Matrix Plot
+```{r}
+#scale Amount column
+cc$Amount <- scale(cc$Amount, center = TRUE, scale = TRUE)
+
+#prepare Class for correlation
+cc$Class <- as.numeric(cc$Class)
+
+#plot the correlation matrix
+cormat<-round(cor(cc),2)
+corrplot(cormat, method = "color")
+```
+
+Heatmap Plot
+```{r}
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+upper_tri <- get_upper_tri(cormat)
+
+# Melt the correlation matrix
+library(reshape2)
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+
+# Plot the heatmap
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+  geom_tile(color = "white")+
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name="Pearson") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                   size = 12, hjust = 1))+
+  coord_fixed()
+```
+
+
+```{r}
+#data preparation and splitting
+cc1<-cc[,-1]
+index<-sample(1:nrow(cc1),as.integer(0.75*nrow(cc1)))
+train <- cc1[index,]
+test <- cc1[-index,]
+```
+
+
+## Methods - Modeling Analysis and Comparison
+After use the train dataset to train the 9 models, apply the models on test dataset to predict respectively. Then measure AUC and AUPRC values, and make plots to compare their accuracies.
+
+### Logistic Regression
+
+The logistic regression is the most basic model to predict a binary response variable. The running time is fast, though the result isn't as accurate.
+```{r}
+##---------------------------logistic regression---------------------------
+m1<-glm(Class~., train,family="binomial")
+
+#apply the model on test dataset to predict
+p0<-predict(m1, test, type = "response")
+
+p1 <- ifelse(p0>0.5, 1, 0)
+
+
+pred1<-prediction(p1,test$Class)
+
+
+auc1 <- performance(pred1, "auc")
+AUPRC1 <- pr.curve(
+  scores.class0 = p1[test$Class == 1], 
+  scores.class1 = p1[test$Class == 0],
+  curve = T,  
+)
+# have auc and AUPRC plots
+plot(performance(pred1, 'sens', 'spec'), main=paste("AUC:", auc1@y.values))
+plot(AUPRC1)
+
+# add values to the result dataframe
+results <- data.frame(Model = "Logistic Regression", AUC = auc1@y.values[[1]],
+                      AUPRC = AUPRC1$auc.integral)
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+```
+
+### Decision Tree
+
+Decision tree model preforms slightly better than the previous one. Also the model also confirms with the previous assumption that V17,V14, and V12 are the most relevant variables.
+```{r}
+##---------------------------decision tree---------------------------
+m2<-rpart(Class ~ ., data = train, method = "class", minbucket = 10)
+
+#check the most important variables
+prp(m2)
+
+#apply the model on test dataset to predict
+p2<-predict(m2, test, type = "class")
+
+p2<-as.numeric(p2)
+pred2<-prediction(p2,test$Class)
+
+auc2 <- performance(pred2, "auc")
+AUPRC2 <- pr.curve(
+  scores.class0 = p2[test$Class == 1], 
+  scores.class1 = p2[test$Class == 0],
+  curve = T,  
+)
+# have auc and AUPRC plots
+plot(performance(pred2, 'sens', 'spec'), main=paste("AUC:", auc2@y.values))
+plot(AUPRC2)
+
+# add values to the result dataframe
+results <- results %>% add_row(
+  Model = "Decision Tree", 
+  AUC = auc2@y.values[[1]],
+  AUPRC = AUPRC2$auc.integral
+)
+
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+```
+
+### Random Forest
+
+Random forest has better results than decision tree model. Though, its running time is probably many times of that. If the ntree value is very big, e.g. 1000, my device will run out of memory. If it's a value of 300, it'd take hours. So for the sake of efficiency, the value is set as 30.
+
+The importance dataframe shows that V17,V14, and V12 are the most relevant variables one more time.
+
+```{r}
+##---------------------------random forest---------------------------
+m3<-randomForest(Class ~ ., data = train, ntree = 30)
+
+#check the most significant varaibles
+data.frame(importance(m3)) %>% arrange(desc(IncNodePurity)) %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE)
+
+#apply the model on test dataset to predict
+p3<-predict(m3,test)
+
+p3<-as.numeric(p3)
+pred3<-prediction(p3,test$Class)
+auc3 <- performance(pred3, "auc")
+AUPRC3 <- pr.curve(
+  scores.class0 = p3[test$Class == 1], 
+  scores.class1 = p3[test$Class == 0],
+  curve = T,  
+)
+
+# have auc and AUPRC plots
+plot(performance(pred3, 'sens', 'spec'), main=paste("AUC:", auc3@y.values))
+plot(AUPRC3)
+
+# add values to the result dataframe
+results <- results %>% add_row(
+  Model = "Random Forest", 
+  AUC = auc3@y.values[[1]],
+  AUPRC = AUPRC3$auc.integral
+)
+
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+
+
+```
+
+### KNN Model
+KNN model also takes a lot of time to run, especially with higher number of folds. Though it's overall accuracy isn't as good as Random Forest model, and even slightly worse than Decision Tree model.
+
+```{r}
+##---------------------------knn model---------------------------
+
+m4 <- knn(train[,-30], test[,-30], train$Class, k=4, prob = TRUE)
+
+p4<-as.numeric(m4)
+
+# compute the AUC and AUPRC values
+pred4<-prediction(p4,test$Class)
+
+auc4 <- performance(pred4, "auc")
+AUPRC4 <- pr.curve(
+  scores.class0 = p4[test$Class == 1], 
+  scores.class1 = p4[test$Class == 0],
+  curve = T,  
+)
+
+# have auc and AUPRC plots
+plot(performance(pred4, 'sens', 'spec'), main=paste("AUC:", auc4@y.values))
+plot(AUPRC4)
+
+# add values to the result dataframe
+results <- results %>% add_row(
+  Model = "KNN Model", 
+  AUC = auc4@y.values[[1]],
+  AUPRC = AUPRC4$auc.integral
+)
+
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+
+```
+
+### SVM Model
+SVM model's running time is the longest, though its accuracy is the lowest. If ksvm function is applied with different thresholds, the result might be better.
+
+Since my computer couldn't deal with the computation power required by training the svm model on the train dataset. Thus only 10% of the original dataset is used to train and test. 
+```{r}
+##---------------------------svm model---------------------------
+
+#split 10% of cc1 into cc5 dataset
+split5<-sample.split(cc1$Class, SplitRatio=0.1)
+cc5<-subset(cc1, split5 == T)
+
+#have the train and test data for svm model
+index5<-sample(1:nrow(cc5),as.integer(0.75*nrow(cc5)))
+train5 <- cc5[index5,]
+test5 <- cc5[-index5,]
+
+m5<-svm(Class ~ ., data = train5, kernel='sigmoid')
+
+#apply the model on test dataset to predict
+p5<-predict(m5,test5)
+
+p5<-as.numeric(p5)
+pred5<-prediction(p5,test5$Class)
+# compute the AUC and AUPRC values
+auc5 <- performance(pred5, "auc")
+AUPRC5 <- pr.curve(
+  scores.class0 = p5[test5$Class == 1], 
+  scores.class1 = p5[test5$Class == 0],
+  curve = T,  
+)
+
+# have auc and AUPRC plots
+plot(performance(pred5, 'sens', 'spec'), main=paste("AUC:", auc5@y.values))
+plot(AUPRC5)
+
+# add values to the result dataframe
+results <- results %>% add_row(
+  Model = "SVM Model", 
+  AUC = auc5@y.values[[1]],
+  AUPRC = AUPRC5$auc.integral
+)
+
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+```
+
+### GMB Model
+
+GMB Model is way faster than SVM, Random Forest, and KNN models with a really good overall accuracy result. No wonder gradient boosted machines are extremely popular, boosted by it's high efficiency and accuracy.
+
+Random forests build an ensemble of deep independent trees, but GBMs build that of shallow and weak successive trees with each tree learning and improving on the previous.
+
+Also, V12,V17, and V14 are three most significant features.
+
+```{r}
+##---------------------------gbm model---------------------------
+
+m6<- gbm(as.character(Class) ~ .,
+                 distribution = "bernoulli", 
+                 data = rbind(train, test), 
+                 n.trees = 500,
+                 interaction.depth = 3, 
+                 n.minobsinnode = 100, 
+                 shrinkage = 0.01, 
+                 train.fraction = 0.75,
+)
+
+# Determine best iteration based on test data
+best.iter = gbm.perf(m6, method = "test")
+
+# Get feature importance
+summary(m6, n.trees = best.iter)
+
+# Make predictions based on this model
+p6 = predict.gbm(
+  m6, 
+  newdata = test, 
+  n.trees = best.iter, 
+  type="response"
+)
+
+p6<-as.numeric(p6)
+pred6<-prediction(p6,test$Class)
+
+# compute the AUC and AUPRC values
+
+auc6 <- performance(pred6, "auc")
+AUPRC6 <- pr.curve(
+  scores.class0 = p6[test$Class == 1], 
+  scores.class1 = p6[test$Class == 0],
+  curve = T,  
+)
+
+# have auc and AUPRC plots
+plot(performance(pred6, 'sens', 'spec'), main=paste("AUC:", auc6@y.values))
+plot(AUPRC6)
+
+# add values to the result dataframe
+results <- results %>% add_row(
+  Model = "GBM Model", 
+  AUC = auc6@y.values[[1]],
+  AUPRC = AUPRC6$auc.integral
+)
+
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+
+```
+
+### LightGBM Model
+
+LightGBM model performs even better that GBM model in efficiency and accuracy. Though, it splits the tree leaf-wise which can lead to overfitting as it produces much complex trees. Nevertheless, we get the highest measure of AUPRC value of 0.8245189 by far.
+
+Also, V14 and V10 are two most significant features.
+```{r}
+##---------------------------lightgbm---------------------------
+
+# make the training and testing data, and train the model
+m7train <- lgb.Dataset(
+  as.matrix(train[, colnames(train) != "Class"]), 
+  label = as.numeric(as.character(train$Class))
+)
+
+m7test <- lgb.Dataset(
+  as.matrix(test[, colnames(test) != "Class"]), 
+  label = test$Class
+)
+
+m7p = list(
+  objective = "binary", 
+  metric = "binary_error"
+)
+
+m7 <- lgb.train(
+  params = m7p, 
+  data = m7train, 
+  valids = list(test = m7test), 
+  learning_rate = 0.01, 
+  nrounds = 500,
+  early_stopping_rounds = 40, 
+  eval_freq = 20
+)
+
+# Get feature importance
+lgb.importance(m7, percentage = TRUE) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE)
+
+# Make predictions based on this model
+p7 = predict(
+  m7, 
+  data = as.matrix(test[, colnames(test) != "Class"]), 
+  n = m7$best_iter)
+
+# compute the AUC and AUPRC values
+pred7 <- prediction(
+  p7, 
+  test$Class
+)
+
+
+auc7 <- performance(pred7, "auc")
+AUPRC7 <- pr.curve(
+  scores.class0 = p7[test$Class == 1], 
+  scores.class1 = p7[test$Class == 0],
+  curve = T,
+)
+
+# have auc and AUPRC plots
+plot(performance(pred7, 'sens', 'spec'), main=paste("AUC:", auc7@y.values))
+plot(AUPRC7)
+
+# add values to the result dataframe
+results <- results %>% add_row(
+  Model = "LightGBM Model", 
+  AUC = auc7@y.values[[1]],
+  AUPRC = AUPRC7$auc.integral
+)
+
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+
+
+
+```
+
+### Xgboost Model
+Xgboost model measures the 3rd best value for AUPRC. The result might be better if some of the hyperparameters like learning rate, depth of the trees, and regularization are tuned more. If lightGBM wasn't an option, xgboost model would be picked due to its efficiency over Random Forest. 
+
+Also, V17 and V14 are the most important variables in predicting Class.
+
+```{r}
+##---------------------------xgboost---------------------------
+
+# make the training and testing data, and train the model
+m8train <- xgb.DMatrix(as.matrix(train[, colnames(train) != "Class"]), 
+                              label = as.numeric(as.character(train$Class)))
+
+m8test <- xgb.DMatrix(as.matrix(test[, colnames(test) != "Class"]), 
+                             label = as.numeric(as.character(test$Class)))
+
+m8 <- xgb.train(
+  data = m8train, 
+  params = list(objective = "binary:logistic", 
+                eta = 0.1, 
+                max.depth = 3, 
+                nthread = 6, 
+                eval_metric = "aucpr"), 
+  watchlist = list(test = m8test), 
+  nrounds = 500, 
+  early_stopping_rounds = 40,
+  print_every_n = 20
+)
+
+# check the importance of the predictors
+xgb.plot.importance(xgb.importance(colnames(train$Class),m8))
+
+
+p8<-predict(m8, 
+  newdata = as.matrix(test[, colnames(test) != "Class"]), 
+  ntreelimit = m8$best_ntreelimit
+)
+
+
+# compute the AUC and AUPRC values
+pred8<-prediction(p8,test$Class)
+
+auc8 <- performance(pred8, "auc")
+AUPRC8 <- pr.curve(
+  scores.class0 = p8[test$Class == 1], 
+  scores.class1 = p8[test$Class == 0],
+  curve = T,  
+)
+
+# have auc and AUPRC plots
+plot(performance(pred8, 'sens', 'spec'), main=paste("AUC:", auc8@y.values))
+plot(AUPRC8)
+
+# add values to the result dataframe
+results <- results %>% add_row(
+  Model = "Xgboost Model", 
+  AUC = auc8@y.values[[1]],
+  AUPRC = AUPRC8$auc.integral
+)
+
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+```
+
+
+### Neural Network
+Keras_model_sequential funcion from kera and tensorflow libraries is used to train the neural network model. Though, the kerafit function does give us a validation accuracy around 99.94%, the evaluation part generates the 3rd lowest AUPRC among all models.
+
+The model training is quite straightforward. Three layers are added. No matter how different the values of the first two layer's units are, the evaluation result stays as underperformed in comparision with tree classification and boosting models.
+ 
+
+```{r}
+##---------------------------neural network---------------------------
+
+X_train <- train[,-30]
+X_test <- test[,-30]
+
+y_train <- train[,30]
+y_test <- test[,30]
+
+m9 <- keras_model_sequential() %>%
+  layer_dense(units = 64, kernel_initializer = "uniform", activation = "relu",
+              input_shape = ncol(X_train)) %>%
+  layer_dense(units = 32, kernel_initializer = "uniform", activation = "relu") %>%
+  layer_dense(units = 1, kernel_initializer = "uniform", activation = "sigmoid")
+
+compile9<-m9 %>% compile(optimizer = "adam",
+               loss = "binary_crossentropy", 
+               metrics = c("binary_accuracy"))
+
+compile9
+
+kerasfit9 <- fit(object = m9,
+               x = as.matrix(X_train),
+               y = as.numeric(y_train),
+               batch_size = 100,
+               epochs = 10,
+               validation_split = 0.25)
+
+plot(kerasfit9) + labs(title = "Deep Learning Training Result")
+
+
+pp9<-predict(object = m9,
+              x = as.matrix(X_test),batch_size = 200,verbose = 0) %>% as.vector()
+head(pp9,3)
+range(pp9)
+
+p9 <- ifelse(pp9>0.5, 1, 0)
+table(p9)
+
+p9a<-m9 %>% predict(as.matrix(X_test)) %>% `>`(0.5) %>% k_cast("int32")  %>% as.vector() 
+table(p9a)
+table(y_test)
+
+# compute the AUC and AUPRC values
+pred9<-prediction(p9,as.numeric(y_test))
+
+auc9 <- performance(pred9, "auc")
+AUPRC9 <- pr.curve(
+  scores.class0 = p9[test$Class == 1], 
+  scores.class1 = p9[test$Class == 0],
+  curve = T,  
+)
+
+# have auc and AUPRC plots
+plot(performance(pred9, 'sens', 'spec'), main=paste("AUC:", auc9@y.values))
+plot(AUPRC9)
+
+# add values to the result dataframe
+results <- results %>% add_row(
+  Model = "Neutral Network", 
+  AUC = auc9@y.values[[1]],
+  AUPRC = AUPRC9$auc.integral
+)
+
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+```
+
+## Results
+After training and testing of 9 different models, lightGBM captures the best AUPRC value at 0.8245189.
+
+```{r}
+# show results 
+results %>%
+  kable() %>%
+  kable_styling(latex_options = "HOLD_position",bootstrap_options = "responsive",
+                position = "center",
+                full_width = FALSE) %>% 
+  column_spec(2,color = "white" , background ="blue") %>% 
+  column_spec(3,color = "white" , background ="red")
+```
+
+## Conclusion
+
+GBM, lightGBM, and XGboost work really well for large dataset both in speed and in accuracy compared with more general classification models. Neural network is extremely fast, and accurate only in keras.fit part. Though, if it gets better tuned, a better accuracy result might be generated.  
+
+However, the dataset is very imbalanced, so undersampling, oversampling, and SMOTE technique could be applied to improve the result accuracy for future work.
